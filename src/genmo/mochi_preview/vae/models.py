@@ -9,10 +9,10 @@ from einops import rearrange
 
 import genmo.mochi_preview.dit.joint_model.context_parallel as cp
 from genmo.lib.progress import get_new_progress_bar
+from genmo.lib.device_helper import autocast_device
 from genmo.mochi_preview.vae.cp_conv import cp_pass_frames, gather_all_frames
 from genmo.mochi_preview.vae.latent_dist import LatentDistribution
 import genmo.mochi_preview.vae.cp_conv as cp_conv
-
 
 def cast_tuple(t, length=1):
     return t if isinstance(t, tuple) else ((t,) * length)
@@ -1015,7 +1015,7 @@ def decode_latents(decoder, z):
     assert z.ndim == 5
     cp_rank, cp_size = cp.get_cp_rank_size()
     z = z.tensor_split(cp_size, dim=2)[cp_rank]  # split along temporal dim
-    with torch.autocast("cuda", dtype=torch.bfloat16):
+    with autocast_device(dtype=torch.bfloat16):
         samples = decoder(z)
     samples = gather_all_frames(samples)
     return normalize_decoded_frames(samples)

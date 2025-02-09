@@ -3,6 +3,7 @@ import math
 
 import torch
 
+from genmo.lib.device_helper import autocast_device
 
 def centers(start: float, stop, num, dtype=None, device=None):
     """linspace through bin centers.
@@ -80,7 +81,7 @@ def compute_mixed_rotation(
         freqs_cos: [N, num_heads, num_freqs] - cosine components
         freqs_sin: [N, num_heads, num_freqs] - sine components
     """
-    with torch.autocast("cuda", enabled=False):
+    with autocast_device(enabled=False):
         assert freqs.ndim == 3
         freqs_sum = torch.einsum("Nd,dhf->Nhf", pos.to(freqs), freqs)
         freqs_cos = torch.cos(freqs_sum)

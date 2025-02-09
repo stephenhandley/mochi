@@ -2,10 +2,12 @@ from contextlib import contextmanager
 
 import torch
 
-
-try:
-    from flash_attn import flash_attn_varlen_func as flash_varlen_attn
-except ImportError:
+if torch.cuda.is_available():
+    try:
+        from flash_attn import flash_attn_varlen_func as flash_varlen_attn
+    except ImportError:
+        flash_varlen_attn = None
+else:
     flash_varlen_attn = None
 
 try:
@@ -17,7 +19,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 training_backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
 eval_backends = list(training_backends)
-if torch.cuda.get_device_properties(0).major >= 9.0:
+if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 9.0:
     # Enable fast CuDNN attention on Hopper.
     # This gives NaN on the backward pass for some reason,
     # so only use it for evaluation.

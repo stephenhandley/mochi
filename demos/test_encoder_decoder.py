@@ -7,6 +7,7 @@ from einops import rearrange
 from safetensors.torch import load_file
 
 from genmo.lib.utils import save_video
+from genmo.lib.device_helper import autocast_device
 from genmo.mochi_preview.pipelines import DecoderModelFactory, decode_latents_tiled_spatial
 from genmo.mochi_preview.vae.models import Encoder, add_fourier_features
 
@@ -61,7 +62,7 @@ def reconstruct(mochi_dir, video_path):
 
     # Encode video to latent
     with torch.inference_mode():
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with autocast_device(dtype=torch.bfloat16):
             t0 = time.time()
             ldist = encoder(video)
             torch.cuda.synchronize()

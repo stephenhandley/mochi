@@ -21,9 +21,8 @@ from genmo.mochi_preview.pipelines import (
 pipeline = None
 model_dir_path = None
 lora_path = None
-num_gpus = torch.cuda.device_count()
+num_gpus = 1 if torch.backends.mps.is_available() else torch.cuda.device_count()
 cpu_offload = False
-
 
 def configure_model(model_dir_path_, lora_path_, cpu_offload_, fast_model_=False):
     global model_dir_path, lora_path, cpu_offload

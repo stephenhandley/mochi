@@ -14,6 +14,7 @@ import genmo.mochi_preview.dit.joint_model.context_parallel as cp
 import genmo.mochi_preview.vae.cp_conv as cp_conv
 from genmo.lib.progress import get_new_progress_bar, progress_bar
 from genmo.lib.utils import Timer, save_video
+from genmo.lib.device_helper import autocast_device
 from genmo.mochi_preview.pipelines import DecoderModelFactory, EncoderModelFactory
 from genmo.mochi_preview.vae.models import add_fourier_features, decode_latents
 
@@ -59,7 +60,7 @@ def preprocess(ctx: GPUContext, vid_path: Path, shape: str, reconstruct: bool):
     video = cp.local_shard(video, dim=2)  # split along time dimension
 
     with torch.inference_mode():
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with autocast_device(dtype=torch.bfloat16):
             ldist = ctx.encoder(video)
 
         print(f"{og_shape} -> {ldist.mean.shape}")
