@@ -2,12 +2,9 @@ from contextlib import contextmanager
 
 import torch
 
-if torch.cuda.is_available():
-    try:
-        from flash_attn import flash_attn_varlen_func as flash_varlen_attn
-    except ImportError:
-        flash_varlen_attn = None
-else:
+try:
+    from flash_attn import flash_attn_varlen_func as flash_varlen_attn
+except ImportError:
     flash_varlen_attn = None
 
 try:
