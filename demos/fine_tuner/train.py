@@ -28,6 +28,7 @@ torch.use_deterministic_algorithms(False)
 import genmo.mochi_preview.dit.joint_model.lora as lora
 from genmo.lib.progress import progress_bar
 from genmo.lib.utils import Timer, save_video
+from genmo.lib.device_helper import autocast_device
 from genmo.mochi_preview.vae.vae_stats import vae_latents_to_dit_latents
 from genmo.mochi_preview.pipelines import (
     DecoderModelFactory,
@@ -358,7 +359,7 @@ def main(config_path):
             z_sigma = (1 - sigma_bcthw) * z + sigma_bcthw * eps
             ut = z - eps
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with autocast_device(dtype=torch.bfloat16):
             preds = model(
                 x=z_sigma,
                 sigma=sigma,

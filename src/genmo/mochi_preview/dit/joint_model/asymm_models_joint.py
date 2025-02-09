@@ -10,6 +10,7 @@ from torch.nn.attention import sdpa_kernel
 
 import genmo.mochi_preview.dit.joint_model.context_parallel as cp
 from genmo.lib.attn_imports import flash_varlen_attn, sage_attn, sdpa_attn_ctx
+from genmo.lib.device_helper import with_autocast
 from genmo.mochi_preview.dit.joint_model.layers import (
     FeedForward,
     PatchEmbed,
@@ -34,7 +35,6 @@ from genmo.mochi_preview.dit.joint_model.utils import (
 
 COMPILE_FINAL_LAYER = os.environ.get("COMPILE_DIT") == "1"
 COMPILE_MMDIT_BLOCK = os.environ.get("COMPILE_DIT") == "1"
-
 
 def ck(fn, *args, enabled=True, **kwargs) -> torch.Tensor:
     if enabled:
@@ -184,7 +184,7 @@ class AsymmetricAttention(nn.Module):
         v = v.view(-1, num_heads, head_dim)
         return q, k, v
 
-    @torch.autocast("cuda", enabled=False)
+    @with_autocast(enabled=False)
     def flash_attention(self, q, k, v, cu_seqlens, max_seqlen_in_batch, total, local_dim):
         out: torch.Tensor = flash_varlen_attn(
             q, k, v,
@@ -207,7 +207,7 @@ class AsymmetricAttention(nn.Module):
             )
             return out
 
-    @torch.autocast("cuda", enabled=False)
+    @with_autocast(enabled=False)
     def sage_attention(self, q, k, v):
         return sage_attn(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
 

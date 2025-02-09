@@ -40,6 +40,7 @@ from genmo.mochi_preview.vae.models import (
     decode_latents_tiled_spatial,
 )
 from genmo.mochi_preview.vae.vae_stats import dit_latents_to_vae_latents
+from genmo.lib.device_helper import autocast_device
 
 
 def load_to_cpu(p, weights_only=True):
@@ -70,6 +71,14 @@ def linear_quadratic_schedule(num_steps, threshold_noise, linear_steps=None):
 T5_MODEL = "google/t5-v1_1-xxl"
 MAX_T5_TOKEN_LENGTH = 256
 
+def get_torch_device(device_id=0):
+    # Prefer MPS if available; fallback order: MPS > CUDA > CPU.
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        return torch.device(f"cuda:{device_id}")
+    else:
+        return torch.device("cpu")
 
 def setup_fsdp_sync(model, device_id, *, param_dtype, auto_wrap_policy) -> FSDP:
     model = FSDP(
@@ -87,7 +96,10 @@ def setup_fsdp_sync(model, device_id, *, param_dtype, auto_wrap_policy) -> FSDP:
         sync_module_states=True,
         use_orig_params=True,
     )
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elif torch.backends.mps.is_available():
+        torch.mps.synchronize()
     return model
 
 
@@ -124,7 +136,7 @@ class T5ModelFactory(ModelFactory):
                 ),
             )
         elif isinstance(device_id, int):
-            model = model.to(torch.device(f"cuda:{device_id}"))  # type: ignore
+            model = model.to(get_torch_device(device_id))  # type: ignore
         return model.eval()
 
 
@@ -243,7 +255,7 @@ class DitModelFactory(ModelFactory):
                 ),
             )
         elif isinstance(device_id, int):
-            model = model.to(torch.device(f"cuda:{device_id}"))
+            model = model.to(get_torch_device(device_id))
         return model.eval()
 
 
@@ -272,7 +284,7 @@ class DecoderModelFactory(ModelFactory):
         # VAE is not FSDP-wrapped
         state_dict = load_file(self.kwargs["model_path"])
         decoder.load_state_dict(state_dict, strict=True)
-        device = torch.device(f"cuda:{device_id}") if isinstance(device_id, int) else "cpu"
+        device = get_torch_device(device_id)
         decoder.eval().to(device)
         return decoder
 
@@ -303,7 +315,7 @@ class EncoderModelFactory(ModelFactory):
         )
         state_dict = load_file(self.kwargs["model_path"])
         encoder.load_state_dict(state_dict, strict=True)
-        device = torch.device(f"cuda:{device_id}") if isinstance(device_id, int) else "cpu"
+        device = get_torch_device(device_id)
         encoder.eval().to(device)
         return encoder
 
@@ -406,6 +418,13 @@ def assert_eq(x, y, msg=None):
 
 
 def sample_model(device, dit, conditioning, **args):
+    # Check if we're running on MPS
+    is_mps = device.type == 'mps'
+    
+    # Use different clipping ranges based on device type
+    CLIP_RANGE = (-1e6, 1e6) if not is_mps else (-1e5, 1e5)
+    UPDATE_CLIP_RANGE = (-1e6, 1e6) if not is_mps else (-100.0, 100.0)
+
     random.seed(args["seed"])
     np.random.seed(args["seed"])
     torch.manual_seed(args["seed"])
@@ -453,18 +472,26 @@ def sample_model(device, dit, conditioning, **args):
 
     def model_fn(*, z, sigma, cfg_scale):
         if cond_batched:
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with autocast_device(dtype=torch.bfloat16):
                 out = dit(z, sigma, **cond_batched)
             out_cond, out_uncond = torch.chunk(out, chunks=2, dim=0)
         else:
             nonlocal cond_text, cond_null
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with autocast_device(dtype=torch.bfloat16):
                 out_cond = dit(z, sigma, **cond_text)
                 out_uncond = dit(z, sigma, **cond_null)
+        
+        # Ensure outputs are finite and in a reasonable range
+        out_cond = torch.nan_to_num(out_cond, nan=0.0, posinf=1.0, neginf=-1.0)
+        out_uncond = torch.nan_to_num(out_uncond, nan=0.0, posinf=1.0, neginf=-1.0)
+                
         assert out_cond.shape == out_uncond.shape
         out_uncond = out_uncond.to(z)
         out_cond = out_cond.to(z)
-        return out_uncond + cfg_scale * (out_cond - out_uncond)
+        pred = out_uncond + cfg_scale * (out_cond - out_uncond)
+        # Clip prediction to avoid explosion
+        pred = torch.clamp(pred, *CLIP_RANGE)
+        return pred
 
     # Euler sampler w/ customizable sigma schedule & cfg scale
     for i in get_new_progress_bar(range(0, sample_steps), desc="Sampling"):
@@ -478,7 +505,10 @@ def sample_model(device, dit, conditioning, **args):
             cfg_scale=cfg_schedule[i],
         )
         assert pred.dtype == torch.float32
-        z = z + dsigma * pred
+        # Add numerical stability to the update
+        update = dsigma * pred
+        update = torch.nan_to_num(update, nan=0.0, posinf=0.0, neginf=0.0)
+        z = torch.clamp(z + update, *UPDATE_CLIP_RANGE)
 
     z = z[:B] if cond_batched else z
     return dit_latents_to_vae_latents(z)
@@ -490,17 +520,16 @@ def move_to_device(model: nn.Module, target_device, *, enabled=True):
         yield
         return
 
-    og_device = next(model.parameters()).device
-    if og_device == target_device:
-        print(f"move_to_device is a no-op model is already on {target_device}")
-    else:
-        print(f"moving model from {og_device} -> {target_device}")
-
+    old_device = next(model.parameters()).device
+    # If target_device is a CUDA device but CUDA is not enabled, fallback to MPS if available.
+    if target_device.type == "cuda" and not torch.cuda.is_available() and torch.backends.mps.is_available():
+        target_device = torch.device("mps")
+    print(f"moving model from {old_device} -> {target_device}")
     model.to(target_device)
     yield
-    if og_device != target_device:
-        print(f"moving model from {target_device} -> {og_device}")
-    model.to(og_device)
+    if old_device != target_device:
+        print(f"moving model from {target_device} -> {old_device}")
+    model.to(old_device)
 
 
 def t5_tokenizer(model_dir=None):
@@ -520,7 +549,7 @@ class MochiSingleGPUPipeline:
         fast_init=True,
         strict_load=True
     ):
-        self.device = torch.device("cuda:0")
+        self.device = get_torch_device()
         self.tokenizer = t5_tokenizer(text_encoder_factory.model_dir)
         t = Timer()
         self.cpu_offload = cpu_offload
@@ -643,6 +672,8 @@ class MochiMultiGPUPipeline:
         dit_factory: ModelFactory,
         decoder_factory: ModelFactory,
         world_size: int,
+        cpu_offload: bool = False,
+        **kwargs
     ):
         ray.init()
         RemoteClass = ray.remote(MultiGPUContext)
