@@ -418,6 +418,13 @@ def assert_eq(x, y, msg=None):
 
 
 def sample_model(device, dit, conditioning, **args):
+    # Check if we're running on MPS
+    is_mps = device.type == 'mps'
+    
+    # Use different clipping ranges based on device type
+    CLIP_RANGE = (-1e6, 1e6) if not is_mps else (-1e5, 1e5)
+    UPDATE_CLIP_RANGE = (-1e6, 1e6) if not is_mps else (-100.0, 100.0)
+
     random.seed(args["seed"])
     np.random.seed(args["seed"])
     torch.manual_seed(args["seed"])
@@ -483,7 +490,7 @@ def sample_model(device, dit, conditioning, **args):
         out_cond = out_cond.to(z)
         pred = out_uncond + cfg_scale * (out_cond - out_uncond)
         # Clip prediction to avoid explosion
-        pred = torch.clamp(pred, -1e6, 1e6)
+        pred = torch.clamp(pred, *CLIP_RANGE)
         return pred
 
     # Euler sampler w/ customizable sigma schedule & cfg scale
@@ -501,7 +508,7 @@ def sample_model(device, dit, conditioning, **args):
         # Add numerical stability to the update
         update = dsigma * pred
         update = torch.nan_to_num(update, nan=0.0, posinf=0.0, neginf=0.0)
-        z = torch.clamp(z + update, -1e6, 1e6)
+        z = torch.clamp(z + update, *UPDATE_CLIP_RANGE)
 
     z = z[:B] if cond_batched else z
     return dit_latents_to_vae_latents(z)

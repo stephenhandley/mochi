@@ -1015,6 +1015,11 @@ def decode_latents(decoder, z):
     assert z.ndim == 5
     cp_rank, cp_size = cp.get_cp_rank_size()
     z = z.tensor_split(cp_size, dim=2)[cp_rank]  # split along temporal dim
+    
+    # Add minimal MPS handling
+    if z.device.type == 'mps':
+        z = z.float()  # Ensure float32 precision
+    
     with autocast_device(dtype=torch.bfloat16):
         samples = decoder(z)
     samples = gather_all_frames(samples)
