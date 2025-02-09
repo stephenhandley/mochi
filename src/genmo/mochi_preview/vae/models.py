@@ -900,99 +900,40 @@ class Encoder(nn.Module):
 
 def normalize_decoded_frames(samples):
     samples = samples.float()
-    samples = (samples + 1.0) / 2.0
+    # Scale values more gradually
+    samples = torch.clamp(samples, -2.0, 2.0)  # Allow slightly wider range
+    samples = (samples + 2.0) / 4.0  # Scale to [0,1] more gradually
     samples.clamp_(0.0, 1.0)
     frames = rearrange(samples, "b c t h w -> b t h w c")
     return frames
 
 
 @torch.inference_mode()
-def decode_latents_tiled_full(
-    decoder,
-    z,
-    *,
-    tile_sample_min_height: int = 240,
-    tile_sample_min_width: int = 424,
-    tile_overlap_factor_height: float = 0.1666,
-    tile_overlap_factor_width: float = 0.2,
-    auto_tile_size: bool = True,
-    frame_batch_size: int = 6,
-):
-    B, C, T, H, W = z.shape
-    assert frame_batch_size <= T, f"frame_batch_size must be <= T, got {frame_batch_size} > {T}"
-
-    tile_sample_min_height = tile_sample_min_height if not auto_tile_size else H // 2 * 8
-    tile_sample_min_width = tile_sample_min_width if not auto_tile_size else W // 2 * 8
-
-    tile_latent_min_height = int(tile_sample_min_height / 8)
-    tile_latent_min_width = int(tile_sample_min_width / 8)
-
-    def blend_v(a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
-        blend_extent = min(a.shape[3], b.shape[3], blend_extent)
-        for y in range(blend_extent):
-            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, :, y, :] * (
-                y / blend_extent
-            )
-        return b
-
-    def blend_h(a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
-        blend_extent = min(a.shape[4], b.shape[4], blend_extent)
-        for x in range(blend_extent):
-            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, :, x] * (
-                x / blend_extent
-            )
-        return b
-
-    overlap_height = int(tile_latent_min_height * (1 - tile_overlap_factor_height))
-    overlap_width = int(tile_latent_min_width * (1 - tile_overlap_factor_width))
-    blend_extent_height = int(tile_sample_min_height * tile_overlap_factor_height)
-    blend_extent_width = int(tile_sample_min_width * tile_overlap_factor_width)
-    row_limit_height = tile_sample_min_height - blend_extent_height
-    row_limit_width = tile_sample_min_width - blend_extent_width
-
-    # Split z into overlapping tiles and decode them separately.
-    # The tiles have an overlap to avoid seams between tiles.
-    pbar = get_new_progress_bar(
-        desc="Decoding latent tiles",
-        total=len(range(0, H, overlap_height)) * len(range(0, W, overlap_width)) * len(range(T // frame_batch_size)),
-    )
-    rows = []
-    for i in range(0, H, overlap_height):
-        row = []
-        for j in range(0, W, overlap_width):
-            temporal = []
-            for k in range(T // frame_batch_size):
-                remaining_frames = T % frame_batch_size
-                start_frame = frame_batch_size * k + (0 if k == 0 else remaining_frames)
-                end_frame = frame_batch_size * (k + 1) + remaining_frames
-                tile = z[
-                    :,
-                    :,
-                    start_frame:end_frame,
-                    i : i + tile_latent_min_height,
-                    j : j + tile_latent_min_width,
-                ]
-                tile = decoder(tile)
-                temporal.append(tile)
-                pbar.update(1)
-            row.append(torch.cat(temporal, dim=2))
-        rows.append(row)
-
-    result_rows = []
-    for i, row in enumerate(rows):
-        result_row = []
-        for j, tile in enumerate(row):
-            # blend the above tile and the left tile
-            # to the current tile and add the current tile to the result row
-            if i > 0:
-                tile = blend_v(rows[i - 1][j], tile, blend_extent_height)
-            if j > 0:
-                tile = blend_h(row[j - 1], tile, blend_extent_width)
-            result_row.append(tile[:, :, :, :row_limit_height, :row_limit_width])
-        result_rows.append(torch.cat(result_row, dim=4))
-
-    return normalize_decoded_frames(torch.cat(result_rows, dim=3))
-
+def decode_latents(decoder, z):
+    assert z.ndim == 5
+    cp_rank, cp_size = cp.get_cp_rank_size()
+    z = z.tensor_split(cp_size, dim=2)[cp_rank]  # split along temporal dim
+    
+    # Add MPS-specific handling
+    is_mps = z.device.type == 'mps'
+    if is_mps:
+        # Ensure float32 precision
+        z = z.float()
+        # Use tiled decoding with larger tiles and more overlap
+        return decode_latents_tiled_spatial(
+            decoder,
+            z,
+            num_tiles_w=4,  # Increase number of tiles
+            num_tiles_h=4,
+            overlap=32,     # Increase overlap
+            min_block_size=8
+        )
+    
+    # Original CUDA path
+    with autocast_device(dtype=torch.bfloat16):
+        samples = decoder(z)
+    samples = gather_all_frames(samples)
+    return normalize_decoded_frames(samples)
 
 @torch.inference_mode()
 def decode_latents_tiled_spatial(
@@ -1001,21 +942,84 @@ def decode_latents_tiled_spatial(
     *,
     num_tiles_w: int,
     num_tiles_h: int,
-    overlap: int = 0,  # Number of pixel of overlap between adjacent tiles.
-    # Use a factor of 2 times the latent downsample factor.
-    min_block_size: int = 1,  # Minimum number of pixels in each dimension when subdividing.
+    overlap: int = 0,
+    min_block_size: int = 1,
 ):
-    decoded = apply_tiled(decoder, z, num_tiles_w, num_tiles_h, overlap, min_block_size)
-    assert decoded is not None, f"Failed to decode latents with tiled spatial method"
+    z = z.float()
+    
+    def decode_tile(tile):
+        with autocast_device(dtype=torch.float32):
+            decoded = decoder(tile)
+        return decoded  # Remove clamping here to preserve detail
+    
+    decoded = apply_tiled(decode_tile, z, num_tiles_w, num_tiles_h, overlap, min_block_size)
+    assert decoded is not None
     return normalize_decoded_frames(decoded)
 
-
 @torch.inference_mode()
-def decode_latents(decoder, z):
-    assert z.ndim == 5
-    cp_rank, cp_size = cp.get_cp_rank_size()
-    z = z.tensor_split(cp_size, dim=2)[cp_rank]  # split along temporal dim
-    with autocast_device(dtype=torch.bfloat16):
-        samples = decoder(z)
-    samples = gather_all_frames(samples)
-    return normalize_decoded_frames(samples)
+def decode_latents_tiled_full(
+    decoder,
+    z,
+    *,
+    tile_size_t: int,
+    tile_size_h: int,
+    tile_size_w: int,
+    overlap_size_t: int = 0,
+    overlap_size_h: int = 0,
+    overlap_size_w: int = 0,
+):
+    """Decode latents in tiles.
+
+    Args:
+        decoder: VAE decoder.
+        z: Input tensor. Shape: [B, C, T, H, W]
+        tile_size_t: Temporal tile size.
+        tile_size_h: Height tile size.
+        tile_size_w: Width tile size.
+        overlap_size_t: Temporal overlap size.
+        overlap_size_h: Height overlap size.
+        overlap_size_w: Width overlap size.
+
+    Returns:
+        decoded: Decoded tensor. Shape: [B, T, H, W, C]
+    """
+    B, C, T, H, W = z.shape
+
+    # Split into tiles.
+    result_rows = []
+    for start_h in range(0, H, tile_size_h - overlap_size_h):
+        result_row = []
+        end_h = min(start_h + tile_size_h, H)
+        start_h = max(0, end_h - tile_size_h)
+
+        for start_w in range(0, W, tile_size_w - overlap_size_w):
+            end_w = min(start_w + tile_size_w, W)
+            start_w = max(0, end_w - tile_size_w)
+
+            for start_t in range(0, T, tile_size_t - overlap_size_t):
+                end_t = min(start_t + tile_size_t, T)
+                start_t = max(0, end_t - tile_size_t)
+
+                # Extract tile.
+                tile = z[:, :, start_t:end_t, start_h:end_h, start_w:end_w]
+
+                # Decode tile.
+                with autocast_device(dtype=torch.bfloat16):
+                    decoded = decoder(tile)
+
+                # Append to results.
+                if start_t == 0:
+                    result_row.append(decoded)
+
+        # Blend tiles horizontally.
+        row = result_row[0]
+        for i in range(1, len(result_row)):
+            row = blend_horizontal(row, result_row[i], overlap_size_w * 16)
+        result_rows.append(row)
+
+    # Blend tiles vertically.
+    result = result_rows[0]
+    for i in range(1, len(result_rows)):
+        result = blend_vertical(result, result_rows[i], overlap_size_h * 16)
+
+    return normalize_decoded_frames(torch.cat(result_rows, dim=3))

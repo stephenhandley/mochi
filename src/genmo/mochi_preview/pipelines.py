@@ -418,6 +418,17 @@ def assert_eq(x, y, msg=None):
 
 
 def sample_model(device, dit, conditioning, **args):
+    def print_stats(name, tensor):
+        print(f"{name} - min: {tensor.min().item():.3f}, max: {tensor.max().item():.3f}, "
+              f"mean: {tensor.mean().item():.3f}, std: {tensor.std().item():.3f}")
+
+    # Check if we're running on MPS
+    is_mps = device.type == 'mps'
+    
+    # Use different clipping ranges based on device type
+    CLIP_RANGE = (-1e6, 1e6) if not is_mps else (-1e5, 1e5)  # Less aggressive clipping
+    UPDATE_CLIP_RANGE = (-1e6, 1e6) if not is_mps else (-100.0, 100.0)  # Allow larger updates
+
     random.seed(args["seed"])
     np.random.seed(args["seed"])
     torch.manual_seed(args["seed"])
@@ -475,15 +486,15 @@ def sample_model(device, dit, conditioning, **args):
                 out_uncond = dit(z, sigma, **cond_null)
         
         # Ensure outputs are finite and in a reasonable range
-        out_cond = torch.nan_to_num(out_cond, nan=0.0, posinf=1.0, neginf=-1.0)
-        out_uncond = torch.nan_to_num(out_uncond, nan=0.0, posinf=1.0, neginf=-1.0)
+        out_cond = torch.nan_to_num(out_cond, nan=0.0, posinf=CLIP_RANGE[1], neginf=CLIP_RANGE[0])
+        out_uncond = torch.nan_to_num(out_uncond, nan=0.0, posinf=CLIP_RANGE[1], neginf=CLIP_RANGE[0])
                 
         assert out_cond.shape == out_uncond.shape
         out_uncond = out_uncond.to(z)
         out_cond = out_cond.to(z)
         pred = out_uncond + cfg_scale * (out_cond - out_uncond)
         # Clip prediction to avoid explosion
-        pred = torch.clamp(pred, -1e6, 1e6)
+        pred = torch.clamp(pred, *CLIP_RANGE)
         return pred
 
     # Euler sampler w/ customizable sigma schedule & cfg scale
@@ -491,20 +502,32 @@ def sample_model(device, dit, conditioning, **args):
         sigma = sigma_schedule[i]
         dsigma = sigma - sigma_schedule[i + 1]
 
-        # `pred` estimates `z_0 - eps`.
         pred = model_fn(
             z=z,
             sigma=torch.full([B] if cond_text else [B * 2], sigma, device=z.device),
             cfg_scale=cfg_schedule[i],
         )
         assert pred.dtype == torch.float32
+        
         # Add numerical stability to the update
         update = dsigma * pred
-        update = torch.nan_to_num(update, nan=0.0, posinf=0.0, neginf=0.0)
-        z = torch.clamp(z + update, -1e6, 1e6)
+        update = torch.nan_to_num(update, nan=0.0, posinf=UPDATE_CLIP_RANGE[1], neginf=UPDATE_CLIP_RANGE[0])
+        if is_mps:
+            update = torch.clamp(update, *UPDATE_CLIP_RANGE)
+        
+        z = torch.clamp(z + update, *CLIP_RANGE)
 
     z = z[:B] if cond_batched else z
-    return dit_latents_to_vae_latents(z)
+    vae_latents = dit_latents_to_vae_latents(z)
+    print_stats("vae_latents", vae_latents)
+    
+    # Monitor VAE decoding process
+    if is_mps:
+        # Ensure VAE input is in a good range
+        vae_latents = torch.clamp(vae_latents, -10.0, 10.0)
+        print_stats("vae_latents (after clamp)", vae_latents)
+    
+    return vae_latents
 
 
 @contextmanager
